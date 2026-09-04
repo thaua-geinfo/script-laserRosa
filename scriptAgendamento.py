@@ -19,7 +19,7 @@ Regras:
 - remove aspas simples/duplas, barra invertida, controles, quebras de linha e espacos excedentes;
 - cliente e relacionado pela base principal + complementar; ausentes com identidade suficiente geram cliente complementar;
 - sala e servico sao relacionados pelo nome no DE-PARA;
-- o profissional e opcional, pois a importacao utiliza a Sala/Agenda como parametro;
+- o profissional da extracao e registrado somente na Observacao; a coluna Profissional da importacao fica sempre vazia, pois a importacao utiliza Sala/Agenda;
 - nomes de servico aceitam busca aproximada quando nao ha correspondencia exata;
 - Observacao recebe "Importacao dd/mm/aaaa" e os dados da extracao nao importados
   nas demais colunas, com rotulo/indicativo;
@@ -49,7 +49,7 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Sequence
 from zipfile import ZipFile
 
-VERSION = "2026-08-26.7"
+VERSION = "2026-09-02.2"
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 def _discover_project_root(script_dir: Path) -> Path:
@@ -1385,6 +1385,7 @@ def build_observation(
     values: Sequence[Any],
     used_indexes: set[int],
     import_date: str,
+    professional_index: int | None = None,
 ) -> str:
     parts: list[str] = []
     for index, raw in enumerate(values):
@@ -1394,6 +1395,8 @@ def build_observation(
         if not value:
             continue
         label = clean_text(source_headers[index] if index < len(source_headers) else "")
+        if professional_index is not None and index == professional_index:
+            label = "Profissional"
         if not label:
             continue
         value = re.sub(
@@ -1486,6 +1489,10 @@ def process_agendamento(
         ]
         max_needed = max(index for index in indexes if index is not None) + 1
         used_indexes = {index for index in indexes if index is not None}
+        # O profissional nao e importado na coluna Profissional. Ele deve permanecer
+        # disponivel para a Observacao, preservando a rastreabilidade do atendimento.
+        if index_executor is not None:
+            used_indexes.discard(index_executor)
 
         for source_line, values in xlsx.iter_rows(
             source_sheet,
@@ -1558,11 +1565,17 @@ def process_agendamento(
 
             duration = clean_text(duration_raw) or clean_text(depara_duration)
             status = map_status(status_raw)
-            observation = build_observation(source_headers, values, used_indexes, import_date)
+            observation = build_observation(
+                source_headers,
+                values,
+                used_indexes,
+                import_date,
+                professional_index=index_executor,
+            )
 
             row = [
                 client_code,
-                clean_text(executor),
+                "",  # Profissional fica vazio; o nome do executor vai para a Observacao.
                 room_code,
                 format_date(appointment_date, xlsx.date1904),
                 format_time(appointment_time, xlsx.date1904),
@@ -1607,7 +1620,8 @@ def process_agendamento(
             if not row[7]:
                 missing.append("Status / Obrigatório")
 
-            # Profissional e opcional: a importacao utiliza Sala/Agenda.
+            # Profissional nao e importado nesta coluna: a importacao utiliza Sala/Agenda.
+            # Quando informado na extracao, ele ja foi preservado na Observacao.
             if missing:
                 rejected.append((source_line, missing))
                 continue
