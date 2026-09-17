@@ -34,7 +34,8 @@ from typing import Any, Iterable
 from collections import defaultdict
 from zipfile import ZipFile
 
-VERSION = "2026-08-26.10"
+VERSION = "2026-09-14.2"
+# OBSERVACAO_GLOBAL_NAO_MAPEADOS_V20260902_3
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 def _existing_layout_dir(root: Path, logical_name: str) -> Path | None:

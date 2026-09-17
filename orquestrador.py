@@ -21,11 +21,13 @@ O orquestrador:
 - captura a saida completa dos scripts para o log e mantem o terminal resumido;
 - sobrescreve sempre o mesmo logOrquestrador.txt diretamente na raiz;
 - no log, registra somente o resumo das etapas que tiveram sucesso e detalha a saida completa apenas em erros/bloqueios;
+- se entrada possuir planilhaTratadaCliente/planilhaTratadaClientes, reutiliza essa base e nao executa o tratamento de Clientes;
 - qualquer arquivo/planilha de entrada ausente torna somente aquela etapa NAO_APLICAVEL;
 - dependencias ausentes tornam a etapa dependente NAO_APLICAVEL sem executar dados incompletos;
 - continua automaticamente as etapas independentes apos falhas/bloqueios;
 - --parar-em-erro permite interromper deliberadamente na primeira pendencia real;
 - mantem Agendamentos como ultima etapa da execucao completa.
+- divide arquivos finais de importacao acima de 20.000 registros em partes numeradas.
 """
 
 from __future__ import annotations
@@ -37,6 +39,7 @@ import io
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -47,7 +50,7 @@ from pathlib import Path
 from functools import lru_cache
 from typing import Iterable, Sequence, TextIO
 
-VERSION = "2026-08-26.10"
+VERSION = "2026-09-14.7"
 FIXED_PAYMENT_CODE = "Conta (uso financeiro)"
 
 
@@ -786,6 +789,326 @@ def _read_csv_text(path: Path) -> tuple[str, str, str]:
     return text, delimiter, encoding
 
 
+
+# REGRA_DIVISAO_SAIDAS_20000_V20260914_7
+MAX_OUTPUT_DATA_ROWS = 20_000
+
+# A divisao e feita apenas nos arquivos finais de importacao. Validacoes,
+# relatorios de rejeicao e logs nao sao divididos.
+FINAL_IMPORT_OUTPUTS_BY_STAGE: dict[str, tuple[str, ...]] = {
+    "clientes": ("planilhaTratadaCliente.csv",),
+    "venda-planos": (
+        "planilhaTratadaVendaPlano.csv",
+        "planilhaTratadaSaldoVendaPlano.csv",
+        "planilhaTratadaClienteVendaPlano.csv",
+    ),
+    "contas-receber": (
+        "planilhaTratadaContasReceber.csv",
+        "planilhaTratadaClienteVendaPlano.csv",
+    ),
+    "contas-pagar": (
+        "planilhaTratadaContasPagar.csv",
+        "planilhaTratadaFornecedorContasPagar.csv",
+    ),
+    "agendamentos": (
+        "planilhaTratadaAgendamento.csv",
+        "planilhaTratadaClienteVendaPlano.csv",
+    ),
+}
+
+DEPENDENCY_OUTPUTS_RESTORABLE = (
+    "planilhaTratadaCliente.csv",
+    "planilhaTratadaClienteVendaPlano.csv",
+)
+
+
+def _split_part_number(base: Path, candidate: Path) -> int | None:
+    pattern = re.compile(
+        rf"^{re.escape(base.stem)}_(\d+){re.escape(base.suffix)}$",
+        re.IGNORECASE,
+    )
+    match = pattern.match(candidate.name)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def _existing_split_parts(base: Path) -> list[Path]:
+    result: list[tuple[int, Path]] = []
+    for candidate in base.parent.glob(f"{base.stem}_*{base.suffix}"):
+        number = _split_part_number(base, candidate)
+        if number is not None:
+            result.append((number, candidate))
+    result.sort(key=lambda item: item[0])
+    return [path for _, path in result]
+
+
+def _remove_stale_split_parts(base: Path, keep: set[Path] | None = None) -> None:
+    keep = keep or set()
+    for path in _existing_split_parts(base):
+        if path in keep:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            pass
+
+
+def _restore_split_csv(base: Path) -> bool:
+    """Reconstroi temporariamente um CSV canonico a partir de suas partes.
+
+    Isso existe apenas para dependencias internas em uma nova execucao. Ao fim
+    do orquestrador, o arquivo volta a ser dividido se exceder 20 mil registros.
+    """
+    if base.is_file():
+        return False
+    parts = _existing_split_parts(base)
+    if not parts:
+        return False
+
+    first_text, delimiter, encoding = _read_csv_text(parts[0])
+    first_reader = csv.reader(io.StringIO(first_text), delimiter=delimiter)
+    expected_header = next(first_reader, None)
+    if not expected_header:
+        raise ValueError(f"Parte sem cabecalho: {parts[0].name}")
+
+    temp = base.with_name(base.name + ".reconstruindo.tmp")
+    try:
+        with temp.open("w", encoding=encoding, newline="") as handle:
+            writer = csv.writer(handle, delimiter=delimiter, lineterminator="\n")
+            writer.writerow(expected_header)
+            for index, part in enumerate(parts):
+                text, part_delimiter, _ = _read_csv_text(part)
+                if part_delimiter != delimiter:
+                    raise ValueError(f"Delimitador divergente em {part.name}")
+                reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+                header = next(reader, None)
+                if header != expected_header:
+                    raise ValueError(f"Cabecalho divergente em {part.name}")
+                for row in reader:
+                    writer.writerow(row)
+        temp.replace(base)
+    finally:
+        if temp.exists():
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+    return True
+
+
+def restore_split_dependencies(output_dir: Path) -> list[str]:
+    restored: list[str] = []
+    for filename in DEPENDENCY_OUTPUTS_RESTORABLE:
+        base = output_dir / filename
+        if _restore_split_csv(base):
+            restored.append(filename)
+    return restored
+
+
+def _split_csv_output(base: Path, max_rows: int = MAX_OUTPUT_DATA_ROWS) -> tuple[list[Path], int]:
+    """Divide CSV em partes de ate max_rows registros, repetindo o cabecalho.
+
+    O limite se refere a registros de dados; o cabecalho nao entra na contagem.
+    Retorna (partes, total_de_registros). Se nao houver necessidade de divisao,
+    partes sera uma lista vazia e o arquivo canonico sera mantido.
+    """
+    text, delimiter, encoding = _read_csv_text(base)
+    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    header = next(reader, None)
+    if not header:
+        _remove_stale_split_parts(base)
+        return [], 0
+    total_rows = sum(1 for _ in reader)
+    if total_rows <= max_rows:
+        _remove_stale_split_parts(base)
+        return [], total_rows
+
+    # Segunda passagem para gravar em blocos. Os temporarios sao validados
+    # antes da remocao do arquivo completo.
+    reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+    header = next(reader)
+    temp_pairs: list[tuple[Path, Path]] = []
+    handle = None
+    writer = None
+    try:
+        for row_index, row in enumerate(reader):
+            if row_index % max_rows == 0:
+                if handle is not None:
+                    handle.close()
+                part_number = row_index // max_rows + 1
+                final_path = base.with_name(f"{base.stem}_{part_number}{base.suffix}")
+                temp_path = final_path.with_name(final_path.name + ".tmp")
+                handle = temp_path.open("w", encoding=encoding, newline="")
+                writer = csv.writer(handle, delimiter=delimiter, lineterminator="\n")
+                writer.writerow(header)
+                temp_pairs.append((temp_path, final_path))
+            writer.writerow(row)
+        if handle is not None:
+            handle.close()
+            handle = None
+
+        final_paths = [final for _, final in temp_pairs]
+        for temp_path, final_path in temp_pairs:
+            temp_path.replace(final_path)
+        _remove_stale_split_parts(base, keep=set(final_paths))
+        base.unlink()
+        return final_paths, total_rows
+    finally:
+        if handle is not None:
+            handle.close()
+        for temp_path, _ in temp_pairs:
+            if temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
+
+
+def final_import_files_for_results(results: Sequence[StageResult], output_dir: Path) -> list[Path]:
+    statuses = {result.stage.key: result.status for result in results}
+    names: set[str] = set()
+    for stage_key, filenames in FINAL_IMPORT_OUTPUTS_BY_STAGE.items():
+        status = statuses.get(stage_key)
+        if status in {"OK", "REUTILIZADO"}:
+            names.update(filenames)
+        elif stage_key == "contas-pagar" and status == "PARCIAL":
+            names.add("planilhaTratadaFornecedorContasPagar.csv")
+
+    # O complementar pode ser atualizado por mais de uma etapa. Se qualquer
+    # uma delas concluiu, ele tambem e elegivel para a regra de 20 mil.
+    if any(statuses.get(key) in {"OK", "REUTILIZADO"} for key in ("venda-planos", "contas-receber", "agendamentos")):
+        names.add("planilhaTratadaClienteVendaPlano.csv")
+
+    return [output_dir / name for name in sorted(names) if (output_dir / name).is_file()]
+
+
+def split_final_import_outputs(
+    results: Sequence[StageResult],
+    output_dir: Path,
+) -> tuple[list[str], list[str]]:
+    summaries: list[str] = []
+    errors: list[str] = []
+    for path in final_import_files_for_results(results, output_dir):
+        try:
+            parts, total_rows = _split_csv_output(path)
+            if parts:
+                summaries.append(
+                    f"{path.name}: {total_rows} registro(s) -> {len(parts)} arquivo(s) "
+                    f"de ate {MAX_OUTPUT_DATA_ROWS} registro(s): "
+                    + ", ".join(part.name for part in parts)
+                )
+        except Exception as exc:
+            errors.append(f"{path.name}: {type(exc).__name__}: {exc}")
+    return summaries, errors
+
+
+
+# REGRA_BASE_CLIENTE_TRATADA_ENTRADA_V2026_09_14_1
+TREATED_CLIENT_BASENAMES = {"planilhatratadacliente", "planilhatratadaclientes"}
+
+
+def _is_treated_client_filename(path: Path) -> bool:
+    if path.suffix.casefold() not in {".csv", ".xlsx"}:
+        return False
+    stem = compact(path.stem)
+    if "vendaplano" in stem or "complement" in stem:
+        return False
+    return any(stem == base or (stem.startswith(base) and stem[len(base):].isdigit()) for base in TREATED_CLIENT_BASENAMES)
+
+
+def find_treated_client_input(input_dir: Path) -> Path | None:
+    """Localiza uma planilha de clientes ja tratada na pasta entrada.
+
+    Esta base tem prioridade absoluta sobre Clientes.xlsx porque os codigos nela
+    presentes ja correspondem aos clientes importados no sistema. Aceita
+    singular/plural e copias numeradas, por exemplo: planilhaTratadaCliente.csv,
+    planilhaTratadaClientes.csv e planilhaTratadaCliente(2).csv. CSV tem
+    prioridade sobre XLSX.
+    """
+    candidates = [path for path in input_dir.iterdir() if path.is_file() and _is_treated_client_filename(path)]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: (0 if path.suffix.casefold() == ".csv" else 1, path.name.casefold()))
+    return candidates[0]
+
+
+def _treated_client_csv_has_required_headers(path: Path) -> bool:
+    try:
+        text, delimiter, _ = _read_csv_text(path)
+        reader = csv.reader(io.StringIO(text), delimiter=delimiter)
+        headers = next(reader, [])
+        keys = {compact(header) for header in headers}
+        return any(key.startswith("codigo") for key in keys) and any(key.startswith("nome") for key in keys)
+    except Exception:
+        return False
+
+
+def _convert_treated_client_xlsx_to_csv(source: Path, destination: Path) -> None:
+    from openpyxl import load_workbook
+
+    workbook = load_workbook(source, read_only=True, data_only=True)
+    try:
+        sheet = workbook[workbook.sheetnames[0]]
+        rows = list(sheet.iter_rows(values_only=True))
+    finally:
+        workbook.close()
+    while rows and not any(value not in (None, "") for value in rows[0]):
+        rows.pop(0)
+    if not rows:
+        raise ValueError(f"{source.name} esta vazia.")
+    headers = ["" if value is None else str(value) for value in rows[0]]
+    keys = {compact(header) for header in headers}
+    if not any(key.startswith("codigo") for key in keys) or not any(key.startswith("nome") for key in keys):
+        raise ValueError(f"{source.name} nao possui os cabecalhos esperados de uma planilha de clientes tratada.")
+    temp = destination.with_name(destination.name + ".tmp")
+    try:
+        with temp.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.writer(handle, delimiter=";", quoting=csv.QUOTE_MINIMAL)
+            for row in rows:
+                writer.writerow(["" if value is None else value for value in row])
+        temp.replace(destination)
+    finally:
+        if temp.exists():
+            try:
+                temp.unlink()
+            except OSError:
+                pass
+
+
+def prepare_treated_client_base(layout: ProjectLayout, source: Path) -> Path:
+    """Disponibiliza a base ja tratada no caminho canonico esperado pelos scripts.
+
+    O arquivo de entrada nunca e alterado. CSV e copiado byte a byte; XLSX e
+    convertido para o CSV canonico apenas para compatibilidade com os scripts
+    dependentes existentes.
+    """
+    destination = layout.output_dir / "planilhaTratadaCliente.csv"
+    if source.suffix.casefold() == ".csv":
+        if not _treated_client_csv_has_required_headers(source):
+            raise ValueError(
+                f"{source.name} foi identificada como planilha tratada de clientes, "
+                "mas nao possui os cabecalhos Codigo/Nome esperados."
+            )
+        temp = destination.with_name(destination.name + ".tmp")
+        try:
+            shutil.copyfile(source, temp)
+            temp.replace(destination)
+        finally:
+            if temp.exists():
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
+    else:
+        _convert_treated_client_xlsx_to_csv(source, destination)
+    return destination
+
+
+def dependency_satisfied(status: str) -> bool:
+    return status in {"OK", "REUTILIZADO"}
+
+
 VALID_CLIENT_UFS = {
     "AC", "AL", "AP", "AM", "BA", "CE", "DF", "ES", "GO", "MA", "MT", "MS",
     "MG", "PA", "PB", "PR", "PE", "PI", "RJ", "RN", "RS", "RO", "RR", "SC",
@@ -973,7 +1296,7 @@ def missing_required_input_reason(stage: StageSpec, output_lines: Sequence[str])
     folded = [ascii_fold(line).strip().casefold() for line in output_lines]
     missing_markers = (
         "nao encontrada", "nao encontrado", "nao encontrei", "nao localizado",
-        "nao localizada", "ausente", "not found", "does not exist",
+        "nao localizada", "nao identificado", "nao identificada", "ausente", "not found", "does not exist",
     )
 
     for line in folded:
@@ -1026,9 +1349,15 @@ def blocking_configuration_reason(stage: StageSpec, output_lines: Sequence[str])
 def classify_stage_status(stage: StageSpec, return_code: int, output_lines: Sequence[str]) -> str:
     if return_code == 0:
         return "OK"
+    folded = [ascii_fold(line).strip().casefold() for line in output_lines]
+    if (
+        stage.key == "contas-pagar"
+        and return_code == 4
+        and any("contas_pagar_nao_aplicavel" in line for line in folded)
+    ):
+        return "PARCIAL"
     if missing_required_input_reason(stage, output_lines):
         return "NAO_APLICAVEL"
-    folded = [ascii_fold(line).strip().casefold() for line in output_lines]
     if any(line.startswith("bloqueado:") for line in folded):
         return "BLOQUEADO"
     return "FALHA"
@@ -1057,7 +1386,9 @@ def success_highlights(output_lines: Sequence[str], layout: ProjectLayout, limit
             or folded.startswith("atencao:")
             or folded.startswith("aviso:")
             or folded.startswith("confirmadas:")
+            or folded.startswith("fornecedores:")
             or folded.startswith("fornecedores complementares:")
+            or folded.startswith("observacoes de fornecedores")
             or folded.startswith("ordem de importacao:")
             or folded.startswith("fora desta importacao")
             or (folded.startswith("clientes:") and any(token in folded for token in ("duplic", "complement")))
@@ -1075,6 +1406,89 @@ def success_highlights(output_lines: Sequence[str], layout: ProjectLayout, limit
         if len(highlights) >= limit:
             break
     return highlights
+
+
+
+
+def _read_xlsx_rows_stdlib(path: Path, preferred_sheet: str = "") -> list[list[str]]:
+    """Le uma aba XLSX para fins de log sem depender de openpyxl/styles.xml."""
+    import posixpath
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pkg_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    def col_index(reference: str) -> int:
+        letters = "".join(ch for ch in reference if "A" <= ch <= "Z")
+        value = 0
+        for ch in letters:
+            value = value * 26 + (ord(ch) - 64)
+        return value - 1
+
+    with zipfile.ZipFile(path) as archive:
+        shared: list[str] = []
+        if "xl/sharedStrings.xml" in archive.namelist():
+            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+            for item in root.findall(f"{{{main_ns}}}si"):
+                shared.append("".join(node.text or "" for node in item.iter(f"{{{main_ns}}}t")))
+
+        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+        rels_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        rels = {
+            rel.attrib.get("Id", ""): rel.attrib.get("Target", "")
+            for rel in rels_root.findall(f"{{{pkg_rel_ns}}}Relationship")
+        }
+        sheets: list[tuple[str, str]] = []
+        sheets_node = workbook.find(f"{{{main_ns}}}sheets")
+        if sheets_node is not None:
+            for sheet in sheets_node.findall(f"{{{main_ns}}}sheet"):
+                name = sheet.attrib.get("name", "")
+                rid = sheet.attrib.get(f"{{{rel_ns}}}id", "")
+                target = rels.get(rid, "")
+                if not target:
+                    continue
+                resolved = target.lstrip("/") if target.startswith("/") else posixpath.normpath(posixpath.join("xl", target))
+                sheets.append((name, resolved))
+        if not sheets:
+            return []
+        selected = None
+        if preferred_sheet:
+            for name, target in sheets:
+                if name.casefold() == preferred_sheet.casefold():
+                    selected = (name, target)
+                    break
+        if selected is None:
+            selected = sheets[-1]
+        root = ET.fromstring(archive.read(selected[1]))
+        result: list[list[str]] = []
+        for row in root.findall(f".//{{{main_ns}}}sheetData/{{{main_ns}}}row"):
+            cells: dict[int, str] = {}
+            max_index = -1
+            for cell in row.findall(f"{{{main_ns}}}c"):
+                idx = col_index(cell.attrib.get("r", ""))
+                if idx < 0:
+                    continue
+                ctype = cell.attrib.get("t", "")
+                value_node = cell.find(f"{{{main_ns}}}v")
+                inline_node = cell.find(f"{{{main_ns}}}is")
+                value = ""
+                if ctype == "inlineStr" and inline_node is not None:
+                    value = "".join(node.text or "" for node in inline_node.iter(f"{{{main_ns}}}t"))
+                elif value_node is not None and value_node.text is not None:
+                    raw = value_node.text
+                    if ctype == "s":
+                        try:
+                            value = shared[int(raw)]
+                        except (ValueError, IndexError):
+                            value = ""
+                    else:
+                        value = raw
+                cells[idx] = value
+                max_index = max(max_index, idx)
+            result.append([cells.get(index, "") for index in range(max_index + 1)])
+        return result
 
 
 def validation_problem_summary(output_lines: Sequence[str], layout: ProjectLayout) -> list[str]:
@@ -1103,28 +1517,22 @@ def validation_problem_summary(output_lines: Sequence[str], layout: ProjectLayou
         try:
             counts: dict[tuple[str, str], int] = {}
             if path.suffix.casefold() == ".xlsx":
-                from openpyxl import load_workbook
-                workbook = load_workbook(path, read_only=True, data_only=True)
-                try:
-                    sheet = workbook["Relatorio Validacao"] if "Relatorio Validacao" in workbook.sheetnames else workbook[workbook.sheetnames[-1]]
-                    iterator = sheet.iter_rows(values_only=True)
-                    headers = next(iterator, None)
-                    if not headers:
+                rows = _read_xlsx_rows_stdlib(path, "Relatorio Validacao")
+                if not rows:
+                    continue
+                headers = rows[0]
+                header_map = {compact(value): index for index, value in enumerate(headers) if value is not None}
+                level_i = header_map.get("nivel")
+                type_i = header_map.get("tipo")
+                if level_i is None or type_i is None:
+                    continue
+                for row in rows[1:]:
+                    level = str(row[level_i] if level_i < len(row) and row[level_i] is not None else "").strip()
+                    category = str(row[type_i] if type_i < len(row) and row[type_i] is not None else "").strip()
+                    if not level or not category or level.upper() == "INFO":
                         continue
-                    header_map = {compact(value): index for index, value in enumerate(headers) if value is not None}
-                    level_i = header_map.get("nivel")
-                    type_i = header_map.get("tipo")
-                    if level_i is None or type_i is None:
-                        continue
-                    for row in iterator:
-                        level = str(row[level_i] if level_i < len(row) and row[level_i] is not None else "").strip()
-                        category = str(row[type_i] if type_i < len(row) and row[type_i] is not None else "").strip()
-                        if not level or not category or level.upper() == "INFO":
-                            continue
-                        key = (level.upper(), category)
-                        counts[key] = counts.get(key, 0) + 1
-                finally:
-                    workbook.close()
+                    key = (level.upper(), category)
+                    counts[key] = counts.get(key, 0) + 1
             elif path.suffix.casefold() in {".csv", ".txt"}:
                 text, delimiter, _ = _read_csv_text(path)
                 rows = csv.reader(io.StringIO(text), delimiter=delimiter)
@@ -1163,6 +1571,8 @@ def write_execution_log(
     results: Sequence[StageResult],
     total_duration: float,
     finished: bool,
+    output_split_summaries: Sequence[str] = (),
+    output_split_errors: Sequence[str] = (),
 ) -> None:
     if log_path is None:
         return
@@ -1170,9 +1580,9 @@ def write_execution_log(
     problems = [result for result in results if result.status in problem_statuses]
     if not finished:
         overall = "EM ANDAMENTO"
-    elif problems:
+    elif problems or output_split_errors:
         overall = "COM PENDENCIAS"
-    elif any(result.status in {"PULADO", "NAO_APLICAVEL"} for result in results):
+    elif any(result.status in {"PULADO", "NAO_APLICAVEL", "PARCIAL"} for result in results):
         overall = "OK / PARCIAL"
     else:
         overall = "OK"
@@ -1189,13 +1599,22 @@ def write_execution_log(
     for result in results:
         status = result.status if result.status != "FALHA" else f"FALHA({result.return_code})"
         lines.append(f"{status:<12} | {result.stage.label:<30} | {result.duration_seconds:>7.1f}s | {result.script.name if result.script else '-'}")
-        if result.status == "OK":
+        if result.status in {"OK", "PARCIAL"}:
             for highlight in success_highlights(result.output_lines, layout):
                 lines.append(f"  - {highlight}")
+            if result.status == "PARCIAL" and result.detail:
+                lines.append(f"  - {result.detail}")
         elif result.status == "NAO_APLICAVEL":
             lines.append(f"  - {result.detail or 'arquivo necessario nao disponivel nesta execucao'}")
         elif result.detail:
             lines.append(f"  - {result.detail}")
+
+    if output_split_summaries or output_split_errors:
+        lines.extend(["", "DIVISAO DE ARQUIVOS FINAIS"])
+        for summary in output_split_summaries:
+            lines.append(f"  - {summary}")
+        for error in output_split_errors:
+            lines.append(f"  - ERRO: {error}")
 
     if problems:
         lines.extend(["", "DETALHES DOS PROBLEMAS"])
@@ -1238,6 +1657,7 @@ def print_inventory(
     layout: ProjectLayout,
     selected: Sequence[StageSpec],
     choices: dict[str, ScriptChoice | None],
+    treated_client_source: Path | None = None,
 ) -> None:
     reporter.line(f"Laser Rosa - Orquestrador v{VERSION}")
     reporter.line(f"Raiz: {layout.root}")
@@ -1247,6 +1667,12 @@ def print_inventory(
     for index, stage in enumerate(selected, start=1):
         choice = choices.get(stage.key)
         dependency_text = ", ".join(stage.dependencies) if stage.dependencies else "nenhuma"
+        if stage.key == "clientes" and treated_client_source is not None:
+            reporter.line(
+                f"  {index}. {stage.label}: BASE TRATADA EM ENTRADA | {treated_client_source.name} "
+                f"| tratamento de Clientes sera ignorado"
+            )
+            continue
         if choice is None:
             reporter.line(
                 f"  {index}. {stage.label}: NAO ENCONTRADO | dependencias: {dependency_text}"
@@ -1283,6 +1709,7 @@ def main() -> int:
         selected = select_stages(args.etapas, args.sem_dependencias)
         import_date = normalize_import_date(args.data_importacao)
         overrides = parse_overrides(args.script, layout, script_dir)
+        treated_client_source = find_treated_client_input(layout.input_dir)
     except (FileNotFoundError, ValueError, OSError) as exc:
         print(f"ERRO: {exc}", file=sys.stderr)
         return 1
@@ -1304,13 +1731,21 @@ def main() -> int:
     # --listar nao cria log e nao altera nenhum arquivo.
     if args.listar:
         reporter = Reporter()
-        print_inventory(reporter, layout, selected, choices)
-        return 0 if all(choices[stage.key] is not None for stage in selected) else 1
+        print_inventory(reporter, layout, selected, choices, treated_client_source)
+        inventory_ok = all(
+            choices[stage.key] is not None or (stage.key == "clientes" and treated_client_source is not None)
+            for stage in selected
+        )
+        return 0 if inventory_ok else 1
 
-    missing = [stage for stage in selected if choices.get(stage.key) is None]
+    missing = [
+        stage for stage in selected
+        if choices.get(stage.key) is None
+        and not (stage.key == "clientes" and treated_client_source is not None)
+    ]
     if missing and not args.ignorar_ausentes:
         reporter = Reporter()
-        print_inventory(reporter, layout, selected, choices)
+        print_inventory(reporter, layout, selected, choices, treated_client_source)
         names = ", ".join(stage.label for stage in missing)
         reporter.line("")
         reporter.line(
@@ -1344,12 +1779,20 @@ def main() -> int:
             reporter.line(f"Data da importacao: {import_date}")
         if log_path is not None:
             reporter.line(f"Log: {log_path}")
+        if treated_client_source is not None:
+            reporter.line(f"Clientes: base tratada detectada em entrada ({treated_client_source.name})")
 
         if args.simular:
             reporter.line("")
             reporter.line("SIMULACAO - nenhum script sera executado")
             for stage in selected:
                 choice = choices.get(stage.key)
+                if stage.key == "clientes" and treated_client_source is not None:
+                    reporter.line(
+                        f"  {stage.label}: REUTILIZADO - {treated_client_source.name} da pasta entrada; "
+                        "scriptCliente.py nao sera executado"
+                    )
+                    continue
                 if choice is None:
                     reporter.line(f"  {stage.label}: PULADO - script ausente")
                     continue
@@ -1360,11 +1803,50 @@ def main() -> int:
             return 0 if not missing else 1
 
         overall_start = time.monotonic()
+        restored_dependencies = restore_split_dependencies(layout.output_dir)
+        if restored_dependencies:
+            reporter.line(
+                "Dependencias internas reconstruidas temporariamente: "
+                + ", ".join(restored_dependencies)
+            )
+        prepared_treated_client: Path | None = None
+        needs_client_base = any(
+            stage.key == "clientes" or "clientes" in stage.dependencies
+            for stage in selected
+        )
+        if treated_client_source is not None and needs_client_base:
+            try:
+                prepared_treated_client = prepare_treated_client_base(layout, treated_client_source)
+            except (OSError, ValueError) as exc:
+                reporter.line(f"ERRO: nao foi possivel preparar a base tratada de Clientes: {exc}")
+                return 1
         reporter.line("")
         reporter.line("EXECUCAO")
 
         for position, stage in enumerate(selected, start=1):
             choice = choices.get(stage.key)
+
+            if stage.key == "clientes" and treated_client_source is not None:
+                result = StageResult(
+                    stage=stage,
+                    status="REUTILIZADO",
+                    duration_seconds=0.0,
+                    script=treated_client_source,
+                    detail=f"base tratada da pasta entrada: {treated_client_source.name}",
+                    version="entrada",
+                    output_lines=[f"Base de Clientes reutilizada: {treated_client_source.name}"],
+                )
+                results.append(result)
+                status_by_stage[stage.key] = result.status
+                reporter.line(
+                    f"[{position}/{len(selected)}] Clientes... REUTILIZADO | {treated_client_source.name} "
+                    "| tratamento ignorado"
+                )
+                write_execution_log(
+                    log_path, layout=layout, results=results,
+                    total_duration=time.monotonic() - overall_start, finished=False,
+                )
+                continue
 
             if choice is None:
                 result = StageResult(
@@ -1381,7 +1863,7 @@ def main() -> int:
             failed_dependencies = [
                 dependency
                 for dependency in stage.dependencies
-                if dependency in status_by_stage and status_by_stage[dependency] != "OK"
+                if dependency in status_by_stage and not dependency_satisfied(status_by_stage[dependency])
             ]
             if failed_dependencies:
                 dependency_labels = ", ".join(STAGE_BY_KEY[key].label for key in failed_dependencies)
@@ -1482,6 +1964,25 @@ def main() -> int:
                     output_lines=output_lines,
                 )
                 reporter.line(f"  NAO_APLICAVEL | {duration:.1f}s | {reason}")
+            elif classified_status == "PARCIAL":
+                reason = (
+                    "fornecedores tratados; Contas a Pagar nao gerado porque a relacao "
+                    "de plano de contas ainda nao foi disponibilizada"
+                )
+                result = StageResult(
+                    stage=stage,
+                    status="PARCIAL",
+                    return_code=return_code,
+                    duration_seconds=duration,
+                    script=choice.path,
+                    detail=reason,
+                    version=choice.version,
+                    command=format_command(command),
+                    output_lines=output_lines,
+                )
+                highlights = success_highlights(output_lines, layout, limit=4)
+                extra = " | " + " | ".join(highlights) if highlights else ""
+                reporter.line(f"  PARCIAL | {duration:.1f}s{extra}")
             else:
                 config_reason = blocking_configuration_reason(stage, output_lines)
                 detail = (
@@ -1514,14 +2015,24 @@ def main() -> int:
                     reporter.line("Execucao interrompida por --parar-em-erro.")
                     break
 
+        split_summaries, split_errors = split_final_import_outputs(results, layout.output_dir)
         total_duration = time.monotonic() - overall_start
         print_summary(reporter, results)
+        if split_summaries or split_errors:
+            reporter.line("")
+            reporter.line("DIVISAO DE ARQUIVOS FINAIS")
+            for summary in split_summaries:
+                reporter.line(f"  {summary}")
+            for error in split_errors:
+                reporter.line(f"  ERRO | {error}")
         reporter.line(f"Duracao total: {total_duration:.1f}s")
         if log_path is not None:
             reporter.line(f"Log consolidado: {log_path}")
         write_execution_log(
             log_path, layout=layout, results=results,
             total_duration=total_duration, finished=True,
+            output_split_summaries=split_summaries,
+            output_split_errors=split_errors,
         )
 
         failed = any(result.status in {"FALHA", "BLOQUEADO", "INTERROMPIDO"} for result in results)
@@ -1529,7 +2040,7 @@ def main() -> int:
             result.status == "PULADO" and "script nao encontrado" in result.detail
             for result in results
         )
-        return 1 if failed or missing_or_skipped else 0
+        return 1 if failed or missing_or_skipped or split_errors else 0
     finally:
         reporter.close()
 

@@ -46,11 +46,10 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Iterator, Sequence
-from zipfile import ZipFile
+from zipfile import ZipFile, ZIP_DEFLATED
 
-from openpyxl import Workbook, load_workbook
-
-VERSION = "2026-08-26.8"
+VERSION = "2026-09-14.2"
+# OBSERVACAO_GLOBAL_NAO_MAPEADOS_V20260902_3
 FORBIDDEN = str.maketrans({'"': '', "'": '', "\\": ''})
 NULL_WORDS = {"", "null", "none", "nan", "nat", "\\n"}
 CELL_REF_RE = re.compile(r"([A-Z]+)(\d+)")
@@ -217,6 +216,91 @@ class XlsxReader:
                     values[index] = value
                 yield row_number, values
                 element.clear()
+
+
+
+
+def _xlsx_column_name(index: int) -> str:
+    result = ""
+    value = index + 1
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def write_simple_xlsx(path: Path, sheet_name: str, rows: Sequence[Sequence[Any]]) -> None:
+    # Grava XLSX simples usando apenas a biblioteca padrao do Python.
+    from xml.sax.saxutils import escape
+
+    safe_sheet = clean_text(sheet_name)[:31] or "Planilha1"
+    sheet_rows: list[str] = []
+    for row_number, row in enumerate(rows, start=1):
+        cells: list[str] = []
+        for column_number, value in enumerate(row):
+            if value is None:
+                continue
+            text = str(value)
+            if text == "":
+                continue
+            reference = f"{_xlsx_column_name(column_number)}{row_number}"
+            escaped = escape(text)
+            cells.append(
+                f'<c r="{reference}" t="inlineStr"><is><t xml:space="preserve">{escaped}</t></is></c>'
+            )
+        sheet_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
+
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>'''
+    package_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>'''
+    workbook_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="{escape(safe_sheet)}" sheetId="1" r:id="rId1"/></sheets>
+</workbook>'''
+    workbook_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+    styles_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/><family val="2"/></font></fonts>
+  <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>'''
+    sheet_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>{"".join(sheet_rows)}</sheetData>
+</worksheet>'''
+
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        with ZipFile(temp, "w", compression=ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", content_types)
+            archive.writestr("_rels/.rels", package_rels)
+            archive.writestr("xl/workbook.xml", workbook_xml)
+            archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+            archive.writestr("xl/styles.xml", styles_xml)
+            archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        temp.replace(path)
+    finally:
+        if temp.exists():
+            try:
+                temp.unlink()
+            except OSError:
+                pass
 
 
 def normalize_name(value: Any) -> str:
@@ -493,14 +577,19 @@ def read_table(path: Path) -> tuple[list[Any], list[list[Any]], str, str]:
         headers, rows, delimiter, encoding = read_csv(path)
         return headers, rows, delimiter, encoding
     if path.suffix.lower() == ".xlsx":
-        wb = load_workbook(path, read_only=True, data_only=True)
-        try:
-            ws = wb[wb.sheetnames[0]]
-            headers = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True)))
-            rows = [list(r) for r in ws.iter_rows(min_row=2, values_only=True)]
-            return headers, rows, ";", "utf-8-sig"
-        finally:
-            wb.close()
+        with XlsxReader(path) as reader:
+            if not reader.sheets:
+                raise ValueError(f"Nenhuma aba encontrada em {path.name}")
+            sheet_name = next(iter(reader.sheets))
+            raw_rows = list(reader.iter_rows(sheet_name, max_col=200))
+        nonempty = [(n, row) for n, row in raw_rows if any(clean_text(value) for value in row)]
+        if not nonempty:
+            return [], [], ";", "utf-8-sig"
+        _, header_row = nonempty[0]
+        last = max((i for i, value in enumerate(header_row) if clean_text(value)), default=-1)
+        headers = list(header_row[: last + 1])
+        rows = [list(row[: len(headers)]) for _, row in nonempty[1:]]
+        return headers, rows, ";", "utf-8-sig"
     raise ValueError(f"Formato de planilha de clientes nao suportado: {path.name}")
 
 
@@ -593,50 +682,65 @@ class PaymentRule:
     destination: str = ""
 
 
-def _select_fp_sheet(wb: Any) -> Any:
+def _select_fp_sheet_name(names: Sequence[str]) -> str:
     aliases = {"fp", "formas de pagamento", "forma de pagamento", "formas pagamento", "pagamento"}
-    normalized = [(norm(name), name) for name in wb.sheetnames]
+    normalized = [(norm(name), name) for name in names]
     for wanted in aliases:
         nw = norm(wanted)
         for current, original in normalized:
             if current == nw or nw in current or current in nw:
-                return wb[original]
-    raise KeyError(f"Aba FP/Formas de Pagamento nao encontrada. Abas: {wb.sheetnames}")
+                return original
+    raise KeyError(f"Aba FP/Formas de Pagamento nao encontrada. Abas: {list(names)}")
 
 
 def load_payment_rules(path: Path) -> dict[str, PaymentRule]:
     if path.suffix.lower() == ".xls":
         raise ValueError(
-            "O DE-PARA esta em .xls. Este script usa openpyxl; salve uma copia do mesmo DE-PARA como .xlsx "
+            "O DE-PARA esta em .xls. Salve uma copia do mesmo DE-PARA como .xlsx "
             "sem alterar suas abas e execute novamente."
         )
-    wb = load_workbook(path, read_only=True, data_only=True)
-    try:
-        ws = _select_fp_sheet(wb)
-        headers = list(next(ws.iter_rows(min_row=1, max_row=1, values_only=True)))
-        source_i = find_header(headers, ["Forma de Pagamento", "Descricao", "Origem", "Forma"], required=False)
-        code_i = find_header(headers, ["Codigo Forma de Pagamento", "Codigo", "Cod", "Destino"], required=False)
-        account_i = find_header(headers, ["Codigo da Conta Destino", "Conta Destino", "Conta"], required=False)
-        if source_i is None or code_i is None:
-            # fallback conservador: primeiras duas colunas preenchidas
-            nonempty = [i for i, h in enumerate(headers) if clean_text(h)]
-            if len(nonempty) < 2:
-                raise ValueError("Aba FP do DE-PARA nao possui colunas suficientes")
-            source_i, code_i = nonempty[:2]
-        rules: dict[str, PaymentRule] = {}
-        for row in ws.iter_rows(min_row=2, values_only=True):
-            source = norm(row_value(row, source_i))
-            code = clean_text(row_value(row, code_i))
-            if not source or not code:
-                continue
-            destination = clean_text(row_value(row, account_i)) if account_i is not None else ""
-            rules[source] = PaymentRule(code=code, destination=destination)
-        if not rules:
-            raise ValueError("Nenhuma forma de pagamento valida encontrada na aba FP do DE-PARA")
-        return rules
-    finally:
-        wb.close()
+    with XlsxReader(path) as reader:
+        sheet_name = _select_fp_sheet_name(list(reader.sheets))
+        raw_rows = list(reader.iter_rows(sheet_name, max_col=80))
+    nonempty = [(number, row) for number, row in raw_rows if any(clean_text(value) for value in row)]
+    if not nonempty:
+        raise ValueError("Aba FP do DE-PARA esta vazia")
 
+    # Procura o cabecalho real nas primeiras linhas, sem depender de styles.xml.
+    best_index = 0
+    best_score = -1
+    for index, (_, candidate) in enumerate(nonempty[:20]):
+        score = 0
+        for aliases in (
+            ["Forma de Pagamento", "Descricao", "Origem", "Forma"],
+            ["Codigo Forma de Pagamento", "Codigo", "Cod", "Destino"],
+            ["Codigo da Conta Destino", "Conta Destino", "Conta"],
+        ):
+            if find_header(candidate, aliases, required=False) is not None:
+                score += 1
+        if score > best_score:
+            best_index, best_score = index, score
+    headers = nonempty[best_index][1]
+    source_i = find_header(headers, ["Forma de Pagamento", "Descricao", "Origem", "Forma"], required=False)
+    code_i = find_header(headers, ["Codigo Forma de Pagamento", "Codigo", "Cod", "Destino"], required=False)
+    account_i = find_header(headers, ["Codigo da Conta Destino", "Conta Destino", "Conta"], required=False)
+    if source_i is None or code_i is None:
+        populated = [i for i, value in enumerate(headers) if clean_text(value)]
+        if len(populated) < 2:
+            raise ValueError("Aba FP do DE-PARA nao possui colunas suficientes")
+        source_i, code_i = populated[:2]
+
+    rules: dict[str, PaymentRule] = {}
+    for _, row in nonempty[best_index + 1 :]:
+        source = norm(row_value(row, source_i))
+        code = clean_text(row_value(row, code_i))
+        if not source or not code:
+            continue
+        destination = clean_text(row_value(row, account_i)) if account_i is not None else ""
+        rules[source] = PaymentRule(code=code, destination=destination)
+    if not rules:
+        raise ValueError("Nenhuma forma de pagamento valida encontrada na aba FP do DE-PARA")
+    return rules
 
 def payment_lookup(rules: dict[str, PaymentRule], value: Any) -> PaymentRule | None:
     key = norm(value)
@@ -738,6 +842,7 @@ def default_destination(payment_code: str) -> str:
 
 
 def build_observation(v: dict[str, Any], import_date: str) -> str:
+    """Preserva dados da extracao sem coluna de destino no modelo de CAR."""
     parts = [
         f"Conta: {clean_text(v['account'])}",
         f"Venda: {clean_text(v['sale'])}",
@@ -749,8 +854,23 @@ def build_observation(v: dict[str, Any], import_date: str) -> str:
         f"Status do pagamento: {clean_text(v['payment_status'])}",
         f"Inadimplente: {clean_text(v['delinquent'])}",
     ]
-    # nome/CPF, vencimento, pagamento e valor ja possuem destino na importacao
+    # nome/CPF, vencimento, pagamento e valor ja possuem destino na importacao.
     parts = [p for p in parts if p.split(":", 1)[1].strip()]
+
+    # Campos que nao foram reconhecidos/mapeados para nenhuma coluna propria
+    # tambem sao preservados, usando o cabecalho real da extracao.
+    seen_extra: set[tuple[str, str]] = set()
+    for label, raw in v.get("_unmapped_observation_fields", []):
+        label_text = clean_text(label)
+        value = clean_text(raw)
+        if not label_text or not value:
+            continue
+        key = (label_text.casefold(), value)
+        if key in seen_extra:
+            continue
+        seen_extra.add(key)
+        parts.append(f"{label_text}: {value}")
+
     parts.append(f"Importação {import_date}")
     return " | ".join(parts)
 
@@ -895,17 +1015,7 @@ def append_sales_plan_clients(
             raise ValueError(f"Cliente complementar incompleto: codigo {code}; faltando {detail}")
 
     if target.suffix.lower() == ".xlsx":
-        wb = load_workbook(target)
-        ws = wb[wb.sheetnames[0]]
-        # Reescreve linhas existentes normalizadas e depois adiciona as novas.
-        if ws.max_row > 1:
-            ws.delete_rows(2, ws.max_row - 1)
-        for row in [*normalized_existing, *new_rows]:
-            ws.append(row)
-        temp = target.with_name(target.stem + ".tmp.xlsx")
-        wb.save(temp)
-        wb.close()
-        temp.replace(target)
+        write_simple_xlsx(target, "Clientes", [headers, *normalized_existing, *new_rows])
     else:
         write_csv_atomic(
             target,
@@ -922,19 +1032,9 @@ def write_validation(path: Path, issues: list[Issue]) -> None:
         if path.exists():
             path.unlink()
         return
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Validacao"
-    ws.append(["Nivel", "Linha origem", "Conta", "Tipo", "Detalhe"])
-    for issue in issues:
-        ws.append([issue.level, issue.line, issue.account, issue.category, issue.detail])
-    ws.freeze_panes = "A2"
-    for col, width in {"A": 12, "B": 14, "C": 14, "D": 34, "E": 90}.items():
-        ws.column_dimensions[col].width = width
-    temp = path.with_name(path.name + ".tmp.xlsx")
-    wb.save(temp)
-    wb.close()
-    temp.replace(path)
+    rows: list[list[Any]] = [["Nivel", "Linha origem", "Conta", "Tipo", "Detalhe"]]
+    rows.extend([[issue.level, issue.line, issue.account, issue.category, issue.detail] for issue in issues])
+    write_simple_xlsx(path, "Validacao", rows)
 
 
 # ---------------------------------------------------------------------------
@@ -959,6 +1059,7 @@ def process(
 
     sheet, headers, _, header_row = read_xlsx_headers(extraction)
     indexes = {key: find_header(headers, aliases) for key, aliases in SOURCE_ALIASES.items()}
+    mapped_source_indexes = {index for index in indexes.values() if isinstance(index, int)}
     source_rows: list[tuple[int, dict[str, Any]]] = []
     skipped = 0
     skipped_reasons: dict[str, int] = defaultdict(int)
@@ -967,6 +1068,13 @@ def process(
         for line, raw in xlsx.iter_rows(sheet, min_row=header_row + 1, max_col=max(120, len(headers))):
             source_total += 1
             values = {key: row_value(raw, idx) for key, idx in indexes.items()}
+            values["_unmapped_observation_fields"] = [
+                (headers[index], row_value(raw, index))
+                for index in range(min(len(headers), len(raw)))
+                if index not in mapped_source_indexes
+                and clean_text(headers[index])
+                and clean_text(row_value(raw, index))
+            ]
             ok, reason = eligible(values)
             if ok:
                 source_rows.append((line, values))

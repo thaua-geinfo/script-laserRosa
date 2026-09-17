@@ -68,7 +68,7 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
-VERSION = "2026-08-26.8"
+VERSION = "2026-09-14.6"
 MODEL_PLACEHOLDER_DATE = "01/06/2026"
 FORBIDDEN_TRANSLATION = str.maketrans({'"': "", "'": "", "\\": ""})
 NULL_WORDS = {"", "null", "none", "nan", "nat"}
@@ -2074,11 +2074,20 @@ def aggregate_sales(table: Table, report: ValidationReport) -> tuple[dict[str, S
         "old_client_code",
     }
     columns = map_columns(table.headers, SALES_FIELD_ALIASES, optional)
+    # OBSERVACAO_GLOBAL_NAO_MAPEADOS_V20260902_3
+    mapped_source_indexes = {index for index in columns.values() if isinstance(index, int)}
     grouped: dict[str, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
     all_source_rows: list[dict[str, Any]] = []
     for line, raw_row in table.rows:
         row = ensure_width(raw_row, len(table.headers))
         values = source_row_dict(row, columns)
+        values["_unmapped_observation_fields"] = [
+            (clean_text(table.headers[index]), clean_text(row_value(row, index)))
+            for index in range(min(len(table.headers), len(row)))
+            if index not in mapped_source_indexes
+            and clean_text(table.headers[index])
+            and clean_text(row_value(row, index))
+        ]
         values["_line"] = line
         all_source_rows.append(values)
         sale_id = normalize_id(values["sale_id"])
@@ -2835,6 +2844,26 @@ def build_sale_observation(sale: SaleAggregate, import_date: str) -> str:
     if item_details:
         parts.append("Itens origem: " + " / ".join(item_details))
 
+    # Campos da extracao sem destino no modelo sao preservados na Observacao.
+    extra_order: list[str] = []
+    extra_labels: dict[str, str] = {}
+    extra_values: dict[str, list[str]] = {}
+    for raw in sale.raw_rows:
+        for label, value in raw.get("_unmapped_observation_fields", []):
+            label_text = clean_text(label)
+            value_text = clean_text(value)
+            if not label_text or not value_text:
+                continue
+            key = label_text.casefold()
+            if key not in extra_values:
+                extra_order.append(key)
+                extra_labels[key] = label_text
+                extra_values[key] = []
+            if value_text not in extra_values[key]:
+                extra_values[key].append(value_text)
+    for key in extra_order:
+        parts.append(f"{extra_labels[key]}: {' / '.join(extra_values[key])}")
+
     # A anotacao da importacao deve ser sempre o ultimo trecho da observacao.
     parts.append(f"Importação {import_date}")
 
@@ -3325,13 +3354,14 @@ def process_balances(
             ]
         )
 
+    # VENDA_SEM_SALDO_NAO_BLOQUEIA_V20260914_6
     sale_ids = set(sales)
     for missing in sorted(sale_ids - source_sale_ids, key=sort_identifier):
-        report.error(
+        report.warning(
             "VENDA_SEM_LINHA_DE_SALDO",
             file=table.path,
             sale_id=missing,
-            detail="Venda existe na extracao de Vendas, mas nao em Sessoes.",
+            detail="Venda existe na extracao de Vendas, mas nao ha linha correspondente na extracao de Sessoes/Saldo. A venda sera exportada; nenhum saldo sera inventado.",
         )
     for extra in sorted(source_sale_ids - sale_ids, key=sort_identifier):
         report.error("SALDO_DE_VENDA_INEXISTENTE", file=table.path, sale_id=extra)
@@ -3742,6 +3772,135 @@ def _output_path(argument: Path | None, default_name: str) -> Path:
     return _resolve_explicit_path(argument, default_dir=OUTPUT_DIR)
 
 
+
+# Validacao final do papel das duas extracoes. O detector principal continua usando
+# o layout; esta etapa impede que dois layouts parecidos sejam usados invertidos.
+
+
+
+
+
+
+# A identificacao final entre Vendas e Sessoes/Areas usa duas evidencias:
+# 1) nomes inequivocos dos arquivos; 2) cobertura relacional dos VendaId.
+# O objetivo e impedir que layouts parecidos sejam processados invertidos.
+
+
+
+
+
+
+
+# VENDA_SESSOES_LAYOUT_FIRST_V20260914_6
+# O papel de cada extracao e decidido primeiro pelo conteudo. Nomes como
+# "Vendas.xls" ou "Sessoes e Areas.xls" podem estar trocados pelo fornecedor
+# da extracao e, portanto, nunca podem sobrepor um layout inequivoco.
+def _lr_role_name_hint(path: Path) -> str:
+    name = normalized_filename(path)
+    has_venda = "venda" in name
+    has_sessao = any(token in name for token in ("sess", "sessa", "sesso", "area"))
+    if has_venda and not has_sessao:
+        return "vendas"
+    if has_sessao and not has_venda:
+        return "sessoes"
+    return ""
+
+
+def _lr_role_schema_scores(path: Path) -> tuple[int, int, str]:
+    """Retorna (pontos_vendas, pontos_sessoes, resumo).
+
+    Usa apenas cabecalhos que realmente distinguem os dois relatorios. Campos
+    compartilhados como VendaId, StatusVenda, ClienteNome e ClienteCpf nao
+    pontuam para nenhum lado.
+    """
+    try:
+        table = read_table(path, ("expdata 1", "Planilha1", "Sheet1"))
+    except Exception as exc:
+        return 0, 0, f"nao foi possivel ler layout: {type(exc).__name__}: {exc}"
+
+    headers = {normalize_header(value) for value in table.headers if normalize_header(value)}
+
+    sales_weights = {
+        normalize_header("VendaDataFaturamento"): 8,
+        normalize_header("ValorVenda"): 8,
+        normalize_header("ClienteCelular"): 5,
+        normalize_header("ObservacaoUnidade"): 5,
+        normalize_header("MotivoCancelamento"): 4,
+        normalize_header("TipoCancelamentoId"): 3,
+        normalize_header("ValorVendaPago"): 4,
+        normalize_header("StatusItemComandaServicoId"): 4,
+        normalize_header("QtdDiasSemAgendamento"): 3,
+        normalize_header("ValorUnitarioSessao"): 3,
+        normalize_header("ValorItem"): 3,
+        normalize_header("PacoteServico"): 2,
+        normalize_header("Categoria"): 2,
+        normalize_header("Unidade"): 2,
+        normalize_header("Observacao"): 2,
+        normalize_header("QtdRealizado"): 2,
+    }
+    session_weights = {
+        normalize_header("PacoteServicosId"): 6,
+        normalize_header("ServicoId"): 7,
+        normalize_header("ServicoNome"): 7,
+        normalize_header("NomeItem"): 5,
+        normalize_header("QuantidadeUtilizada"): 7,
+        normalize_header("Quantidade"): 3,
+    }
+
+    sales_score = sum(weight for header, weight in sales_weights.items() if header in headers)
+    session_score = sum(weight for header, weight in session_weights.items() if header in headers)
+    sample = ", ".join(clean_text(value) for value in table.headers[:12])
+    return sales_score, session_score, sample
+
+
+def _lr_fix_sales_session_roles(vendas: Path, sessoes: Path) -> tuple[Path, Path, str]:
+    v_sales, v_sessions, v_headers = _lr_role_schema_scores(vendas)
+    s_sales, s_sessions, s_headers = _lr_role_schema_scores(sessoes)
+
+    current_score = v_sales + s_sessions
+    swapped_score = s_sales + v_sessions
+
+    # Classificacao forte por layout individual.
+    vendas_looks_session = v_sessions >= v_sales + 5 and v_sessions >= 6
+    sessoes_looks_sales = s_sales >= s_sessions + 5 and s_sales >= 6
+    vendas_looks_sales = v_sales >= v_sessions + 5 and v_sales >= 6
+    sessoes_looks_session = s_sessions >= s_sales + 5 and s_sessions >= 6
+
+    if vendas_looks_session and sessoes_looks_sales:
+        return sessoes, vendas, (
+            "reordenado pelo layout: "
+            f"{vendas.name} pontuou Vendas={v_sales}/Sessoes={v_sessions}; "
+            f"{sessoes.name} pontuou Vendas={s_sales}/Sessoes={s_sessions}"
+        )
+
+    if vendas_looks_sales and sessoes_looks_session:
+        return vendas, sessoes, ""
+
+    # Quando um arquivo e ambiguo, compara a orientacao conjunta. A troca so e
+    # feita com vantagem clara para evitar oscilacao por cabecalhos comuns.
+    if swapped_score >= current_score + 6 and s_sales >= 4 and v_sessions >= 4:
+        return sessoes, vendas, (
+            "reordenado pela pontuacao conjunta do layout: "
+            f"orientacao atual={current_score}; invertida={swapped_score}; "
+            f"{vendas.name}[V={v_sales},S={v_sessions}] / "
+            f"{sessoes.name}[V={s_sales},S={s_sessions}]"
+        )
+
+    if current_score >= swapped_score + 6:
+        return vendas, sessoes, ""
+
+    # Somente em empate/ambiguidade real o nome pode desempatar.
+    venda_hint = _lr_role_name_hint(vendas)
+    sessao_hint = _lr_role_name_hint(sessoes)
+    if venda_hint == "sessoes" and sessao_hint == "vendas":
+        return sessoes, vendas, (
+            "layout ambiguo; reordenado apenas por desempate de nome: "
+            f"{vendas.name} / {sessoes.name}"
+        )
+
+    return vendas, sessoes, ""
+
+
 def main() -> int:
     args = build_parser().parse_args()
     try:
@@ -3790,6 +3949,16 @@ def main() -> int:
             search_dir=INPUT_DIR,
             exclude=(vendas,),
         )
+        vendas, sessoes, _role_reason = _lr_fix_sales_session_roles(vendas, sessoes)
+        if _role_reason:
+            print(f"Ajuste de identificacao por layout: Vendas={vendas.name} | Sessoes={sessoes.name}")
+            report.warning(
+                "ARQUIVOS_VENDAS_SESSOES_REORDENADOS",
+                file=vendas,
+                origin=_role_reason,
+                detail="A selecao automatica foi corrigida pelo layout real dos arquivos antes do processamento.",
+            )
+
         clientes = resolve_file(
             args.clientes,
             "planilhaTratadaCliente(s)",

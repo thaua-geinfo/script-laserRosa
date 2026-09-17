@@ -71,10 +71,9 @@ from pathlib import Path
 from typing import Any, Iterable, Sequence
 import xml.etree.ElementTree as ET
 
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Font, PatternFill
 
-VERSION = "2026-08-25.1"
+VERSION = "2026-09-14.4"
+# OBSERVACAO_GLOBAL_NAO_MAPEADOS_V20260902_3
 FIXED_PAYMENT_CODE = "Conta (uso financeiro)"
 SUPPLIER_OBSERVATION_PREFIX = "Fornecedor gerado por Contas a Pagar"
 LEGACY_SUPPLIER_OBSERVATION_PREFIXES = (
@@ -87,6 +86,91 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SCRIPT_DIR
 INPUT_DIR = PROJECT_ROOT / "entrada"
 OUTPUT_DIR = PROJECT_ROOT / "saida"
+
+
+
+
+def _xlsx_column_name(index: int) -> str:
+    result = ""
+    value = index + 1
+    while value:
+        value, remainder = divmod(value - 1, 26)
+        result = chr(65 + remainder) + result
+    return result
+
+
+def write_simple_xlsx(path: Path, sheet_name: str, rows: Sequence[Sequence[Any]]) -> None:
+    # Grava XLSX simples usando apenas a biblioteca padrao do Python.
+    from xml.sax.saxutils import escape
+
+    safe_sheet = clean_text(sheet_name)[:31] or "Planilha1"
+    sheet_rows: list[str] = []
+    for row_number, row in enumerate(rows, start=1):
+        cells: list[str] = []
+        for column_number, value in enumerate(row):
+            if value is None:
+                continue
+            text = str(value)
+            if text == "":
+                continue
+            reference = f"{_xlsx_column_name(column_number)}{row_number}"
+            escaped = escape(text)
+            cells.append(
+                f'<c r="{reference}" t="inlineStr"><is><t xml:space="preserve">{escaped}</t></is></c>'
+            )
+        sheet_rows.append(f'<row r="{row_number}">{"".join(cells)}</row>')
+
+    content_types = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>
+  <Default Extension="xml" ContentType="application/xml"/>
+  <Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>
+  <Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>
+  <Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>
+</Types>'''
+    package_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/>
+</Relationships>'''
+    workbook_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">
+  <sheets><sheet name="{escape(safe_sheet)}" sheetId="1" r:id="rId1"/></sheets>
+</workbook>'''
+    workbook_rels = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/>
+  <Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>
+</Relationships>'''
+    styles_xml = '''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <fonts count="1"><font><sz val="11"/><name val="Calibri"/><family val="2"/></font></fonts>
+  <fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>
+  <borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>
+  <cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>
+  <cellXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/></cellXfs>
+  <cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>
+</styleSheet>'''
+    sheet_xml = f'''<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">
+  <sheetData>{"".join(sheet_rows)}</sheetData>
+</worksheet>'''
+
+    temp = path.with_name(path.name + ".tmp")
+    try:
+        with zipfile.ZipFile(temp, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("[Content_Types].xml", content_types)
+            archive.writestr("_rels/.rels", package_rels)
+            archive.writestr("xl/workbook.xml", workbook_xml)
+            archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels)
+            archive.writestr("xl/styles.xml", styles_xml)
+            archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+        temp.replace(path)
+    finally:
+        if temp.exists():
+            try:
+                temp.unlink()
+            except OSError:
+                pass
 
 
 def script_hash() -> str:
@@ -715,24 +799,9 @@ def read_xlsx_sheets_xml(path: Path) -> list[RawSheet]:
 
 
 def read_xlsx_sheets(path: Path) -> list[RawSheet]:
-    try:
-        workbook = load_workbook(path, read_only=True, data_only=True)
-    except Exception:
-        return read_xlsx_sheets_xml(path)
-
-    try:
-        date1904 = bool(getattr(workbook, "epoch", None) and getattr(workbook.epoch, "year", 1899) == 1904)
-        result: list[RawSheet] = []
-        for worksheet in workbook.worksheets:
-            rows: list[tuple[int, list[Any]]] = []
-            for row_number, values in enumerate(worksheet.iter_rows(values_only=True), start=1):
-                row = list(values)
-                if any(clean_text(value) for value in row):
-                    rows.append((row_number, row))
-            result.append(RawSheet(path=path, name=worksheet.title, rows=rows, date1904=date1904))
-        return result
-    finally:
-        workbook.close()
+    # Leitura deliberadamente independente de openpyxl. Alem de eliminar uma
+    # dependencia externa, tolera arquivos cujo styles.xml esta corrompido.
+    return read_xlsx_sheets_xml(path)
 
 
 def find_header(headers: Sequence[Any], aliases: Sequence[str], *, required: bool = True) -> int | None:
@@ -1947,6 +2016,22 @@ def build_observation(
             "Data de pagamento informada na origem apesar de a conta nao estar confirmada: "
             + unconfirmed_payment_date
         )
+
+    # Qualquer coluna da extracao que nao tenha destino proprio no modelo e
+    # preservada em Observacao. A forma de pagamento informada na origem entra
+    # aqui porque a importacao usa deliberadamente um codigo fixo.
+    seen_extra: set[tuple[str, str]] = set()
+    for label, raw in values.get("_unmapped_observation_fields", []):
+        label_text = clean_text(label)
+        value = clean_text(raw)
+        if not label_text or not value:
+            continue
+        key = (label_text.casefold(), value)
+        if key in seen_extra:
+            continue
+        seen_extra.add(key)
+        parts.append(f"{label_text}: {value}")
+
     parts.append(f"Importação {import_date}")
     return " | ".join(parts)
 
@@ -1987,6 +2072,138 @@ def assign_transaction_codes(
         result[source_id] = str(next_code)
         next_code += 1
     return result
+
+
+def process_suppliers_only(
+    extraction_path: Path,
+    supplier_model_path: Path,
+    supplier_primary_path: Path | None,
+    supplier_complement_path: Path,
+    *,
+    import_date: str,
+    report: ValidationReport,
+) -> tuple[Table, list[list[str]], list[GeneratedSupplier], int, int, int]:
+    """Gera/atualiza fornecedores mesmo quando Contas a Pagar nao pode ser tratado.
+
+    Esta rotina depende apenas da extracao de Contas a Pagar e do modelo de
+    Fornecedor. A relacao de plano de contas nao participa da identificacao ou
+    criacao dos fornecedores.
+    """
+    supplier_template = read_csv_table(supplier_model_path)
+    if len(supplier_template.headers) != 14:
+        raise ValueError(
+            "Modelo de Fornecedor deve possuir 14 colunas; "
+            f"encontrado: {len(supplier_template.headers)}."
+        )
+
+    if supplier_complement_path.is_file():
+        supplier_target = read_csv_table(supplier_complement_path)
+        if [clean_text(value) for value in supplier_target.headers] != [
+            clean_text(value) for value in supplier_template.headers
+        ]:
+            raise ValueError(
+                "O cabecalho do arquivo complementar de fornecedores diverge do modelo."
+            )
+    else:
+        supplier_target = Table(
+            path=supplier_complement_path,
+            sheet=supplier_complement_path.name,
+            header_row=1,
+            headers=list(supplier_template.headers),
+            rows=[],
+            delimiter=supplier_template.delimiter,
+            encoding=supplier_template.encoding,
+        )
+
+    supplier_indexes = map_model_fields(supplier_target.headers, SUPPLIER_MODEL_FIELDS)
+    observations_updated = update_existing_supplier_observations(
+        supplier_target, supplier_indexes, import_date
+    )
+
+    extraction, _ = locate_xlsx_table(
+        extraction_path,
+        {"supplier": EXTRACTION_SIGNATURE["supplier"]},
+        minimum_score=1,
+    )
+    supplier_index = find_header(extraction.headers, EXTRACTION_SIGNATURE["supplier"])
+
+    supplier_paths: list[Path] = []
+    if supplier_primary_path is not None and supplier_primary_path.is_file():
+        supplier_paths.append(supplier_primary_path)
+    if supplier_complement_path.is_file():
+        supplier_paths.append(supplier_complement_path)
+    suppliers = load_supplier_catalog(supplier_paths)
+
+    generated_by_key: dict[str, GeneratedSupplier] = {}
+    source_identities: set[str] = set()
+    matched_existing = 0
+    ambiguous_count = 0
+
+    for line, raw_row in extraction.rows:
+        supplier_name = clean_text(row_value(raw_row, supplier_index))
+        if not supplier_name:
+            continue
+        identity = compact(supplier_name)
+        if not identity:
+            continue
+        source_identities.add(identity)
+
+        supplier_code, match_method = match_supplier(suppliers, supplier_name)
+        if supplier_code:
+            matched_existing += 1
+            continue
+        if match_method.startswith("AMBIGUO"):
+            ambiguous_count += 1
+            report.warning(
+                "FORNECEDOR_AMBIGUO",
+                file=extraction_path,
+                line=line,
+                supplier=supplier_name,
+                detail=(
+                    "Mais de um codigo possivel no cadastro tratado; "
+                    "nenhum novo fornecedor foi criado para esta identidade."
+                ),
+            )
+            continue
+
+        generated = generated_by_key.get(identity)
+        if generated is None:
+            generated = GeneratedSupplier(
+                code=next_supplier_code(suppliers.used_codes),
+                name=supplier_name,
+            )
+            generated_by_key[identity] = generated
+            add_supplier_to_catalog(suppliers, generated.code, generated.name)
+
+    generated_suppliers = list(generated_by_key.values())
+    supplier_rows = [
+        build_supplier_row(
+            supplier_target.headers,
+            supplier_indexes,
+            supplier,
+            import_date,
+        )
+        for supplier in generated_suppliers
+    ]
+    for supplier, row in zip(generated_suppliers, supplier_rows):
+        missing = validate_supplier_row(supplier_target.headers, supplier_indexes, row)
+        if missing:
+            report.error(
+                "FORNECEDOR_COMPLEMENTAR_INCOMPLETO",
+                file=supplier_model_path,
+                source_id=supplier.code,
+                supplier=supplier.name,
+                detail=", ".join(missing),
+            )
+
+    return (
+        supplier_target,
+        supplier_rows,
+        generated_suppliers,
+        observations_updated,
+        len(source_identities),
+        ambiguous_count,
+    )
 
 
 def process(
@@ -2045,6 +2262,14 @@ def process(
         minimum_score=7,
     )
     columns = source_columns(extraction.headers)
+    # Campos reconhecidos que efetivamente alimentam colunas/regras de saida.
+    # "payment" fica propositalmente de fora: a forma da importacao e fixa e o
+    # valor da origem deve ser preservado em Observacao.
+    mapped_source_indexes = {
+        index
+        for field_name, index in columns.items()
+        if isinstance(index, int) and field_name != "payment"
+    }
     account_relations = load_account_relations(account_relation_path, report)
 
     # Regra fixa definida para Contas a Pagar. O valor nao e extraido das
@@ -2078,6 +2303,13 @@ def process(
             field_name: row_value(raw_row, index)
             for field_name, index in columns.items()
         }
+        values["_unmapped_observation_fields"] = [
+            (extraction.headers[index], row_value(raw_row, index))
+            for index in range(min(len(extraction.headers), len(raw_row)))
+            if index not in mapped_source_indexes
+            and clean_text(extraction.headers[index])
+            and clean_text(row_value(raw_row, index))
+        ]
         source_id = normalize_id(values["id"])
         values["_source_id"] = source_id
         prepared_rows.append((line, values))
@@ -2664,75 +2896,20 @@ def write_validation(path: Path, report: ValidationReport) -> None:
     if not path.parent.is_dir():
         raise FileNotFoundError(f"Pasta de validacao nao existe: {path.parent}")
 
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = "Validacao"
     headers = [
-        "Nivel",
-        "Tipo",
-        "Arquivo",
-        "Linha origem",
-        "Id origem",
-        "Favorecido",
-        "Campo",
-        "Valor origem",
-        "Valor comparado",
-        "Detalhe",
+        "Nivel", "Tipo", "Arquivo", "Linha origem", "Id origem",
+        "Favorecido", "Campo", "Valor origem", "Valor comparado", "Detalhe",
     ]
-    worksheet.append(headers)
-    header_fill = PatternFill("solid", fgColor="1F4E78")
-    header_font = Font(color="FFFFFF", bold=True)
-    for cell in worksheet[1]:
-        cell.fill = header_fill
-        cell.font = header_font
+    rows: list[list[Any]] = [headers]
+    rows.extend([
+        [
+            issue.level, issue.category, issue.file, issue.line, issue.source_id,
+            issue.supplier, issue.field, issue.origin, issue.compared, issue.detail,
+        ]
+        for issue in findings
+    ])
+    write_simple_xlsx(path, "Validacao", rows)
 
-    for issue in findings:
-        worksheet.append(
-            [
-                issue.level,
-                issue.category,
-                issue.file,
-                issue.line,
-                issue.source_id,
-                issue.supplier,
-                issue.field,
-                issue.origin,
-                issue.compared,
-                issue.detail,
-            ]
-        )
-        row_number = worksheet.max_row
-        color = "F4CCCC" if issue.level == "ERRO" else "FCE5CD"
-        worksheet.cell(row=row_number, column=1).fill = PatternFill("solid", fgColor=color)
-
-    worksheet.freeze_panes = "A2"
-    worksheet.auto_filter.ref = worksheet.dimensions
-    widths = {
-        "A": 10,
-        "B": 38,
-        "C": 34,
-        "D": 14,
-        "E": 16,
-        "F": 36,
-        "G": 30,
-        "H": 35,
-        "I": 35,
-        "J": 90,
-    }
-    for column, width in widths.items():
-        worksheet.column_dimensions[column].width = width
-
-    temporary = path.with_name(path.name + ".tmp.xlsx")
-    try:
-        workbook.save(temporary)
-        workbook.close()
-        if path.exists() and files_are_identical(temporary, path):
-            unlink_with_retry(temporary)
-        else:
-            ensure_target_replaceable(path)
-            replace_with_retry(temporary, path)
-    finally:
-        cleanup_staged_files([temporary])
 
 
 # ---------------------------------------------------------------------------
@@ -2836,10 +3013,6 @@ def main() -> int:
         explicit_extraction = resolve_argument(args.entrada, INPUT_DIR)
         explicit_accounts = resolve_argument(args.plano_contas, INPUT_DIR)
         extraction = discover_extraction(INPUT_DIR, explicit_extraction)
-        account_relation = discover_account_relation(INPUT_DIR, explicit_accounts)
-        model = resolve_argument(args.modelo, INPUT_DIR) or resolve_variant(
-            "modeloImportacaoContasPagar", {".csv"}, INPUT_DIR
-        )
         supplier_model = resolve_argument(args.modelo_fornecedores, INPUT_DIR) or resolve_variant(
             "modeloImportacaoFornecedor", {".csv"}, INPUT_DIR
         )
@@ -2854,7 +3027,6 @@ def main() -> int:
             OUTPUT_DIR / "validacaoContasPagar.xlsx"
         )
 
-        assert model is not None
         assert supplier_model is not None
 
         # Remove restos de uma execucao anterior interrompida. O CSV final nao e
@@ -2877,6 +3049,97 @@ def main() -> int:
             import_date = date.today().strftime("%d/%m/%Y")
 
         print(f"Data da importacao: {import_date}")
+
+        # Fornecedores nao dependem da relacao de plano de contas. Se esse
+        # arquivo ainda nao foi enviado, gera/atualiza primeiro a planilha
+        # complementar de fornecedores e deixa somente Contas a Pagar como
+        # nao aplicavel nesta execucao.
+        try:
+            account_relation = discover_account_relation(INPUT_DIR, explicit_accounts)
+        except FileNotFoundError as account_exc:
+            if "relacao de plano de contas" not in ascii_fold(str(account_exc)).casefold():
+                raise
+
+            (
+                supplier_target_table,
+                supplier_rows,
+                generated_suppliers,
+                supplier_observations_updated,
+                supplier_source_count,
+                ambiguous_suppliers,
+            ) = process_suppliers_only(
+                extraction,
+                supplier_model,
+                supplier_primary,
+                supplier_complement,
+                import_date=import_date,
+                report=report,
+            )
+
+            if report.error_count:
+                write_validation(validation_path, report)
+                print(
+                    f"BLOQUEADO [v{VERSION}]: {report.error_count} erro(s) e "
+                    f"{report.warning_count} aviso(s) no tratamento de fornecedores.",
+                    file=sys.stderr,
+                )
+                print(f"Validacao: {validation_path}", file=sys.stderr)
+                return 2
+
+            if generated_suppliers or supplier_observations_updated:
+                merged_supplier_rows = merge_supplier_rows(supplier_target_table, supplier_rows)
+                staged_supplier = stage_csv(
+                    supplier_complement,
+                    supplier_target_table.headers,
+                    merged_supplier_rows,
+                    delimiter=supplier_target_table.delimiter,
+                    encoding=supplier_target_table.encoding,
+                )
+                validate_csv_output(
+                    staged_supplier,
+                    supplier_target_table.headers,
+                    len(merged_supplier_rows),
+                    expected_observation_suffix=f"Importação {import_date}",
+                )
+                write_validation(validation_path, report)
+                _, unchanged_files = commit_staged_files([(staged_supplier, supplier_complement)])
+                staged_supplier = None
+            else:
+                unchanged_files = []
+                write_validation(validation_path, report)
+
+            print(
+                f"Fornecedores: {supplier_source_count} identidade(s) identificada(s) na extracao."
+            )
+            print(
+                f"Fornecedores complementares: {len(generated_suppliers)} -> {supplier_complement}"
+            )
+            if supplier_observations_updated:
+                print(
+                    "Observacoes de fornecedores atualizadas para "
+                    f"{import_date}: {supplier_observations_updated} -> {supplier_complement}"
+                )
+            if ambiguous_suppliers:
+                print(
+                    f"Fornecedores ambiguos: {ambiguous_suppliers} ocorrencia(s); "
+                    "consulte a validacao."
+                )
+            if supplier_complement in unchanged_files:
+                print("Fornecedores complementares: o CSV existente ja estava atualizado.")
+            if report.warning_count:
+                print(f"Validacao: {report.warning_count} aviso(s) -> {validation_path}")
+            else:
+                print("Validacao de fornecedores: nenhum erro ou aviso.")
+            print(
+                "CONTAS_PAGAR_NAO_APLICAVEL: relacao de plano de contas nao encontrada; "
+                "fornecedores foram tratados normalmente."
+            )
+            return 4
+
+        model = resolve_argument(args.modelo, INPUT_DIR) or resolve_variant(
+            "modeloImportacaoContasPagar", {".csv"}, INPUT_DIR
+        )
+        assert model is not None
 
         result, model_table, supplier_target_table, supplier_rows, supplier_observations_updated = process(
             extraction,
