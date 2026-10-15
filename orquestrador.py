@@ -50,7 +50,7 @@ from pathlib import Path
 from functools import lru_cache
 from typing import Iterable, Sequence, TextIO
 
-VERSION = "2026-09-14.7"
+VERSION = "2026-10-07.1"
 FIXED_PAYMENT_CODE = "Conta (uso financeiro)"
 
 
@@ -1045,28 +1045,163 @@ def _treated_client_csv_has_required_headers(path: Path) -> bool:
 
 
 def _convert_treated_client_xlsx_to_csv(source: Path, destination: Path) -> None:
-    from openpyxl import load_workbook
+    """Converte uma base de Clientes tratada XLSX para o CSV canonico.
 
-    workbook = load_workbook(source, read_only=True, data_only=True)
+    A leitura e feita apenas com a biblioteca padrao do Python, diretamente
+    sobre o XML interno do XLSX. Assim, a reutilizacao da base ja importada
+    nao depende de openpyxl e tambem tolera workbooks com styles.xml
+    inconsistente. O arquivo XLSX original em entrada nunca e alterado.
+    """
+    import posixpath
+    import zipfile
+    import xml.etree.ElementTree as ET
+
+    main_ns = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+    rel_ns = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+    pkg_rel_ns = "http://schemas.openxmlformats.org/package/2006/relationships"
+
+    def column_index(reference: str) -> int:
+        letters = "".join(ch for ch in reference.upper() if "A" <= ch <= "Z")
+        value = 0
+        for ch in letters:
+            value = value * 26 + (ord(ch) - 64)
+        return value - 1
+
+    def read_sheet_rows(archive: zipfile.ZipFile, target: str, shared: Sequence[str]) -> list[list[str]]:
+        rows: list[list[str]] = []
+        with archive.open(target) as handle:
+            for _, row_node in ET.iterparse(handle, events=("end",)):
+                if row_node.tag.rsplit("}", 1)[-1] != "row":
+                    continue
+                cells: dict[int, str] = {}
+                max_index = -1
+                for cell in list(row_node):
+                    if cell.tag.rsplit("}", 1)[-1] != "c":
+                        continue
+                    index = column_index(cell.attrib.get("r", ""))
+                    if index < 0:
+                        continue
+                    cell_type = cell.attrib.get("t", "")
+                    value_node = next((child for child in cell if child.tag.rsplit("}", 1)[-1] == "v"), None)
+                    inline_node = next((child for child in cell if child.tag.rsplit("}", 1)[-1] == "is"), None)
+                    value = ""
+                    if cell_type == "inlineStr" and inline_node is not None:
+                        value = "".join(
+                            node.text or ""
+                            for node in inline_node.iter()
+                            if node.tag.rsplit("}", 1)[-1] == "t"
+                        )
+                    elif value_node is not None and value_node.text is not None:
+                        raw = value_node.text
+                        if cell_type == "s":
+                            try:
+                                shared_index = int(raw)
+                                value = shared[shared_index] if 0 <= shared_index < len(shared) else ""
+                            except ValueError:
+                                value = ""
+                        elif cell_type == "b":
+                            value = "TRUE" if raw == "1" else "FALSE"
+                        else:
+                            value = raw
+                    cells[index] = value
+                    max_index = max(max_index, index)
+                rows.append([cells.get(index, "") for index in range(max_index + 1)])
+                row_node.clear()
+        return rows
+
     try:
-        sheet = workbook[workbook.sheetnames[0]]
-        rows = list(sheet.iter_rows(values_only=True))
-    finally:
-        workbook.close()
-    while rows and not any(value not in (None, "") for value in rows[0]):
+        with zipfile.ZipFile(source) as archive:
+            names = set(archive.namelist())
+            if "xl/workbook.xml" not in names:
+                raise ValueError(f"{source.name} nao possui uma estrutura XLSX valida.")
+
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in names:
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                for item in root.findall(f"{{{main_ns}}}si"):
+                    shared.append("".join(node.text or "" for node in item.iter(f"{{{main_ns}}}t")))
+
+            workbook = ET.fromstring(archive.read("xl/workbook.xml"))
+            rels: dict[str, str] = {}
+            rel_path = "xl/_rels/workbook.xml.rels"
+            if rel_path in names:
+                rel_root = ET.fromstring(archive.read(rel_path))
+                for rel in rel_root.findall(f"{{{pkg_rel_ns}}}Relationship"):
+                    rel_id = rel.attrib.get("Id", "")
+                    target = rel.attrib.get("Target", "")
+                    if rel_id and target:
+                        if target.startswith("/"):
+                            resolved = target.lstrip("/")
+                        else:
+                            resolved = posixpath.normpath(posixpath.join("xl", target))
+                        rels[rel_id] = resolved
+
+            sheet_targets: list[tuple[str, str]] = []
+            sheets_node = workbook.find(f"{{{main_ns}}}sheets")
+            if sheets_node is not None:
+                for sheet in sheets_node.findall(f"{{{main_ns}}}sheet"):
+                    name = sheet.attrib.get("name", "Sheet")
+                    rel_id = sheet.attrib.get(f"{{{rel_ns}}}id", "")
+                    target = rels.get(rel_id, "")
+                    if target in names:
+                        sheet_targets.append((name, target))
+
+            if not sheet_targets:
+                raise ValueError(f"Nenhuma planilha encontrada em {source.name}.")
+
+            best_rows: list[list[str]] | None = None
+            best_score = -1
+            expected_markers = {
+                "codigo", "nome", "cpf", "documentoauxiliar", "telefone",
+                "celular", "email", "sexo", "cep", "status", "observacao",
+            }
+
+            # A planilha tratada pode conter uma linha de titulo ou varias abas.
+            # Procuramos o cabecalho real nas primeiras 50 linhas de cada aba.
+            for _sheet_name, target in sheet_targets:
+                sheet_rows = read_sheet_rows(archive, target, shared)
+                for header_index, row in enumerate(sheet_rows[:50]):
+                    normalized = [compact(value) for value in row]
+                    keys = {key for key in normalized if key}
+                    has_code = any(key == "codigo" or key.startswith("codigo") for key in keys)
+                    has_name = any(key == "nome" or key.startswith("nome") for key in keys)
+                    if not (has_code and has_name):
+                        continue
+                    score = sum(1 for marker in expected_markers if any(key == marker or key.startswith(marker) for key in keys))
+                    if score > best_score:
+                        best_score = score
+                        best_rows = sheet_rows[header_index:]
+
+            if best_rows is None:
+                raise ValueError(
+                    f"{source.name} nao possui os cabecalhos esperados de uma planilha de clientes tratada."
+                )
+
+            rows = best_rows
+    except zipfile.BadZipFile as exc:
+        raise ValueError(f"{source.name} nao e um XLSX valido: {exc}") from exc
+
+    # Remove linhas totalmente vazias no inicio/fim e limita a largura a ultima
+    # coluna nomeada do cabecalho para nao criar separadores artificiais.
+    while rows and not any(str(value or "").strip() for value in rows[0]):
         rows.pop(0)
+    while rows and not any(str(value or "").strip() for value in rows[-1]):
+        rows.pop()
     if not rows:
         raise ValueError(f"{source.name} esta vazia.")
-    headers = ["" if value is None else str(value) for value in rows[0]]
-    keys = {compact(header) for header in headers}
-    if not any(key.startswith("codigo") for key in keys) or not any(key.startswith("nome") for key in keys):
-        raise ValueError(f"{source.name} nao possui os cabecalhos esperados de uma planilha de clientes tratada.")
+
+    header = [str(value or "") for value in rows[0]]
+    last_header = max((index for index, value in enumerate(header) if value.strip()), default=-1)
+    if last_header < 0:
+        raise ValueError(f"{source.name} nao possui cabecalho valido.")
+    width = last_header + 1
+    rows = [(row + [""] * width)[:width] for row in rows]
+
     temp = destination.with_name(destination.name + ".tmp")
     try:
         with temp.open("w", encoding="utf-8-sig", newline="") as handle:
             writer = csv.writer(handle, delimiter=";", quoting=csv.QUOTE_MINIMAL)
-            for row in rows:
-                writer.writerow(["" if value is None else value for value in row])
+            writer.writerows(rows)
         temp.replace(destination)
     finally:
         if temp.exists():

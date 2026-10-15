@@ -68,7 +68,10 @@ from pathlib import Path
 from typing import Any, Iterable, Iterator, Sequence
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
-VERSION = "2026-09-14.6"
+VERSION = "2026-10-07.1"
+# SALDOS_FORA_IMPORTACAO_V20260923_1
+# Regra: linhas de Sessoes/Saldo cujo VendaId nao existe na extracao de Vendas
+# ficam fora desta importacao. Nao e permitido inventar/remapear VendaId por cliente.
 MODEL_PLACEHOLDER_DATE = "01/06/2026"
 FORBIDDEN_TRANSLATION = str.maketrans({'"': "", "'": "", "\\": ""})
 NULL_WORDS = {"", "null", "none", "nan", "nat"}
@@ -1936,8 +1939,10 @@ def build_generated_client_rows(
             row[indexes["status"]] = "Leads"
         if indexes["origin_type"] is not None:
             row[indexes["origin_type"]] = "Parcerias"
-        if indexes["origin_code"] is not None and client.old_codes:
-            row[indexes["origin_code"]] = sorted(client.old_codes, key=sort_identifier)[0]
+        if indexes["origin_code"] is not None:
+            # Codigo Origem e identificador interno do sistema; nunca transportar
+            # o codigo antigo da extracao para esta coluna.
+            row[indexes["origin_code"]] = ""
         if indexes["ddi_mobile"] is not None and client.phone:
             row[indexes["ddi_mobile"]] = "55"
 
@@ -2270,7 +2275,7 @@ def _candidate_codes(index: dict[str, set[str]], keys: Iterable[str]) -> set[str
     return result
 
 
-def match_client(
+def _match_client_pre_history_v20260928_1(
     sale: SaleAggregate,
     catalog: ClientCatalog,
     report: ValidationReport,
@@ -2444,6 +2449,179 @@ def match_client(
             detail="Nenhuma chave e nenhum Codigo Cliente utilizavel foram encontrados.",
         )
     return "", "NAO_LOCALIZADO"
+
+
+# CLIENTE_AMBIGUO_HISTORICO_V20260928_1
+# Uma venda com CPF ausente/truncado pode ficar ambigua quando Nome+Celular existem
+# em mais de um cadastro tratado. Somente reutilizamos um codigo quando a MESMA
+# identidade (Nome+Celular) ja apareceu nesta extracao e foi resolvida por CPF.
+_CLIENTE_HISTORICO_POR_NOME_CELULAR = {}
+
+
+def _cliente_hist_text(value):
+    import re as _re
+    import unicodedata as _unicodedata
+    text = "" if value is None else str(value).strip()
+    text = "".join(
+        ch for ch in _unicodedata.normalize("NFKD", text)
+        if not _unicodedata.combining(ch)
+    ).casefold()
+    return " ".join(_re.findall(r"[a-z0-9]+", text))
+
+
+def _cliente_hist_attr(obj, kind):
+    if obj is None:
+        return ""
+    try:
+        names = list(vars(obj))
+    except Exception:
+        names = [name for name in dir(obj) if not name.startswith("_")]
+    normalized = []
+    for name in names:
+        low = str(name).casefold()
+        if "client" not in low and "cliente" not in low:
+            continue
+        if kind == "name" and not any(token in low for token in ("name", "nome")):
+            continue
+        if kind == "phone" and not any(token in low for token in ("cell", "celular", "phone", "mobile", "fone", "telefone")):
+            continue
+        try:
+            value = getattr(obj, name)
+        except Exception:
+            continue
+        if value is None or callable(value):
+            continue
+        normalized.append(str(value).strip())
+    return next((value for value in normalized if value), "")
+
+
+def _cliente_hist_key(sale):
+    import re as _re
+    name = _cliente_hist_text(_cliente_hist_attr(sale, "name"))
+    phone_raw = _cliente_hist_attr(sale, "phone")
+    phone = "".join(_re.findall(r"\d", str(phone_raw or "")))
+    if len(phone) > 11:
+        phone = phone[-11:]
+    if not name or len(phone) < 8:
+        return None
+    return (name, phone)
+
+
+def prepare_client_history_from_sales(sales, catalog):
+    """Precarrega historico forte Nome+Celular -> codigo usando CPF unico.
+
+    A resolucao nao pode depender da ordem dos VendaId. Antes de processar as
+    vendas, varremos toda a extracao e registramos somente identidades cuja
+    combinacao Nome+Celular aparece em uma venda com CPF que aponta para um
+    unico codigo em planilhaTratadaCliente. CPF duplicado nunca alimenta este
+    historico.
+    """
+    _CLIENTE_HISTORICO_POR_NOME_CELULAR.clear()
+    for sale in sales.values():
+        key = _cliente_hist_key(sale)
+        cpf = digits_only(getattr(sale, "client_cpf", ""))
+        if not key or not cpf:
+            continue
+        codes = set(catalog.by_cpf.get(cpf, set()))
+        if len(codes) != 1:
+            continue
+        selected = next(iter(codes))
+        _CLIENTE_HISTORICO_POR_NOME_CELULAR.setdefault(key, set()).add(str(selected))
+
+
+class _ClienteHistoricoReportProxy:
+    def __init__(self, target):
+        self._target = target
+        self.cliente_ambiguo = []
+
+    def error(self, code, *args, **kwargs):
+        if str(code) == "CLIENTE_AMBIGUO":
+            self.cliente_ambiguo.append((code, args, dict(kwargs)))
+            return None
+        return self._target.error(code, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._target, name)
+
+
+def _cliente_hist_result_parts(result):
+    if isinstance(result, tuple):
+        code = result[0] if result else None
+        method = result[1] if len(result) > 1 else ""
+        return code, method
+    return result, ""
+
+
+def _cliente_hist_candidates(captured):
+    import re as _re
+    values = []
+    for _code, _args, kwargs in captured:
+        for key in ("origin", "compared"):
+            value = kwargs.get(key)
+            if value not in (None, ""):
+                values.append(str(value))
+    blob = " | ".join(values)
+    candidates = set()
+    for match in _re.finditer(r"(?:CELULAR|NOME)\s*=\s*([0-9,; /]+)", blob, flags=_re.I):
+        candidates.update(_re.findall(r"\d+", match.group(1)))
+    return candidates, blob
+
+
+def match_client(*args, **kwargs):
+    import inspect as _inspect
+    original = globals()["_match_client_pre_history_v20260928_1"]
+    signature = _inspect.signature(original)
+    bound = signature.bind_partial(*args, **kwargs)
+    sale = bound.arguments.get("sale")
+    report = bound.arguments.get("report")
+
+    if sale is None or report is None:
+        return original(*args, **kwargs)
+
+    proxy = _ClienteHistoricoReportProxy(report)
+    bound.arguments["report"] = proxy
+    result = original(*bound.args, **bound.kwargs)
+    code, method = _cliente_hist_result_parts(result)
+    key = _cliente_hist_key(sale)
+
+    # O historico forte foi precarregado antes desta etapa a partir de toda a
+    # extracao. Assim, a resolucao nao depende da ordem numerica dos VendaId.
+    if code not in (None, ""):
+        return result
+
+    if proxy.cliente_ambiguo and key:
+        historic = _CLIENTE_HISTORICO_POR_NOME_CELULAR.get(key, set())
+        candidates, candidate_text = _cliente_hist_candidates(proxy.cliente_ambiguo)
+        usable = historic & candidates if candidates else set()
+        if len(historic) == 1 and len(usable) == 1:
+            selected = next(iter(usable))
+            first_kwargs = proxy.cliente_ambiguo[0][2]
+            warn_kwargs = {
+                name: first_kwargs[name]
+                for name in ("file", "line", "sale_id")
+                if name in first_kwargs
+            }
+            warn_kwargs.update({
+                "field": "Nome/Celular + historico CPF",
+                "origin": candidate_text or first_kwargs.get("origin", ""),
+                "compared": selected,
+                "detail": (
+                    "Ambiguidade resolvida com seguranca: a mesma combinacao Nome+Celular "
+                    "ja apareceu nesta extracao e foi relacionada por CPF a um unico codigo; "
+                    "o codigo historico tambem esta entre os candidatos desta venda."
+                ),
+            })
+            report.warning("CLIENTE_AMBIGUO_RESOLVIDO_POR_HISTORICO", **warn_kwargs)
+            if isinstance(result, tuple):
+                if len(result) <= 1:
+                    return (selected,)
+                return (selected, "HISTORICO_NOME_CELULAR_CPF") + tuple(result[2:])
+            return selected
+
+    # Nao ha evidencia forte suficiente: preserva exatamente o bloqueio original.
+    for err_code, err_args, err_kwargs in proxy.cliente_ambiguo:
+        report.error(err_code, *err_args, **err_kwargs)
+    return result
 
 def build_service_catalog(table: Table, report: ValidationReport) -> ServiceCatalog:
     """Carrega codigo/descricao da aba de Servicos do DE-PARA.
@@ -3215,12 +3393,12 @@ def process_balances(
             continue
         source_sale_ids.add(sale_id)
         if sale_id not in sales:
-            report.error(
-                "SALDO_SEM_VENDA_CORRESPONDENTE",
+            report.info(
+            "SALDO_SEM_VENDA_CORRESPONDENTE",
                 file=table.path,
                 line=line,
                 sale_id=sale_id,
-                detail="O VendaId existe em Sessoes, mas nao na extracao de Vendas.",
+                detail="Fora desta importacao: o VendaId existe em Sessoes/Saldo, mas nao na extracao de Vendas atual. Nenhum saldo sera criado nem remapeado por cliente.",
             )
             continue
         sale = sales[sale_id]
@@ -3364,7 +3542,8 @@ def process_balances(
             detail="Venda existe na extracao de Vendas, mas nao ha linha correspondente na extracao de Sessoes/Saldo. A venda sera exportada; nenhum saldo sera inventado.",
         )
     for extra in sorted(source_sale_ids - sale_ids, key=sort_identifier):
-        report.error("SALDO_DE_VENDA_INEXISTENTE", file=table.path, sale_id=extra)
+        report.warning(
+            "SALDO_DE_VENDA_INEXISTENTE", file=table.path, sale_id=extra)
     for old_id, new_codes in old_service_to_new.items():
         if len(new_codes) > 1:
             report.error(
@@ -3393,7 +3572,7 @@ def process_balances(
         file=table.path,
         origin=len(table.rows),
         compared=len(output_rows),
-        detail="Linhas validas de Sessoes exportadas; linhas de vendas rejeitadas permanecem somente na rastreabilidade/validacao.",
+        detail="Linhas lidas de Sessoes e linhas efetivamente exportadas. VendaId ausente da extracao de Vendas fica fora desta importacao e nao gera saldo artificial.",
     )
     return output_rows, trace_rows, rejected_balance_total
 
@@ -3695,11 +3874,11 @@ def check_output_integrity(
         )
     expected_balances = source_balance_count - rejected_balance_count
     if len(balance_rows) != expected_balances:
-        report.error(
+        report.warning(
             "CONTAGEM_SALDOS_FINAL",
             origin=len(balance_rows),
             compared=expected_balances,
-            detail="Cada linha de Sessoes de uma venda apta deve gerar uma linha no saldo.",
+            detail="A contagem bruta de Sessoes pode incluir VendaId ausente da extracao de Vendas. Essas linhas ficam fora desta importacao; divergencias reais continuam validadas separadamente.",
         )
     sale_codes = [row[0] for row in sales_rows if row]
     if len(sale_codes) != len(set(sale_codes)):
@@ -4050,6 +4229,7 @@ def main() -> int:
         generated_client_registry = GeneratedClientRegistry.from_catalog(client_catalog)
         service_catalog = build_service_catalog(service_table, report)
         sale_codes = assign_sale_codes(sales, args.codigo_venda, report)
+        prepare_client_history_from_sales(sales, client_catalog)
         sale_rows = build_sales_output(
             sales,
             client_catalog,

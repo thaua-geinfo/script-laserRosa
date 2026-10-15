@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """Tratamento de Agendamentos - Laser Rosa.
 
 Estrutura do projeto:
@@ -49,8 +49,9 @@ from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Sequence
 from zipfile import ZipFile
 
-VERSION = "2026-09-17.2"
+VERSION = "2026-10-07.1"
 # OBSERVACAO_GLOBAL_NAO_MAPEADOS_V20260902_3
+# AGENDAMENTO_CONSOLIDADO_V20260923_2
 SCRIPT_DIR = Path(__file__).resolve().parent
 
 def _discover_project_root(script_dir: Path) -> Path:
@@ -1564,7 +1565,7 @@ def process_agendamento(
             else:
                 service_code, depara_duration, service_method = "", "", "NAO_APLICAVEL"
 
-            duration = clean_text(duration_raw) or clean_text(depara_duration) or "10"
+            duration = clean_text(duration_raw) or clean_text(depara_duration)
             status = map_status(status_raw)
             observation = build_observation(
                 source_headers,
